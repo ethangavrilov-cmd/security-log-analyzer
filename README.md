@@ -13,6 +13,9 @@ python main.py /var/log/auth.log --threshold 5 --window-minutes 10 --mode rate \
   --spray-min-users 5 --spray-min-attempts 10
 ```
 
+Add `--output report.json` or `--output report.csv` to save a structured report while
+still printing the console summary.
+
 Use the default threshold of 5 when the `--threshold` flag is omitted.
 
 ### Time-window detection

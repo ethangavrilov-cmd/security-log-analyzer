@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict, deque
+import csv
 from datetime import datetime, timedelta
 from pathlib import Path
+import json
 import re
 from typing import Iterable, Mapping
 
@@ -148,6 +150,11 @@ def _parse_args() -> argparse.Namespace:
         default=10,
         help="Minimum failed attempts per IP to flag password spraying (default: 10).",
     )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Optional path to write a JSON or CSV report (use .json or .csv extension).",
+    )
     return parser.parse_args()
 
 
@@ -182,6 +189,97 @@ def detect_password_spraying(
     }
 
 
+def _build_report(
+    *,
+    flagged: Mapping[str, int],
+    spray_suspects: Mapping[str, dict[str, int]],
+    settings: Mapping[str, int | str],
+) -> dict[str, object]:
+    brute_force = [
+        {"ip": ip, "failed_logins": count}
+        for ip, count in sorted(flagged.items(), key=lambda item: item[1], reverse=True)
+    ]
+
+    password_spraying = [
+        {
+            "ip": ip,
+            "attempt_count": stats["attempt_count"],
+            "user_count": stats["user_count"],
+        }
+        for ip, stats in sorted(
+            spray_suspects.items(), key=lambda item: item[1]["attempt_count"], reverse=True
+        )
+    ]
+
+    return {
+        "run_settings": settings,
+        "brute_force": brute_force,
+        "password_spraying": password_spraying,
+        "top_offenders": brute_force,
+    }
+
+
+def _write_json_report(path: Path, report: Mapping[str, object]) -> None:
+    path.write_text(json.dumps(report, indent=2))
+
+
+def _write_csv_report(path: Path, report: Mapping[str, object]) -> None:
+    with path.open("w", newline="") as csvfile:
+        writer = csv.DictWriter(
+            csvfile,
+            fieldnames=[
+                "type",
+                "field",
+                "ip",
+                "failed_logins",
+                "attempt_count",
+                "user_count",
+                "value",
+            ],
+        )
+        writer.writeheader()
+
+        for key, value in report.get("run_settings", {}).items():
+            writer.writerow({"type": "run_setting", "field": key, "value": value})
+
+        for entry in report.get("brute_force", []):
+            writer.writerow(
+                {
+                    "type": "brute_force",
+                    "ip": entry.get("ip"),
+                    "failed_logins": entry.get("failed_logins"),
+                }
+            )
+
+        for entry in report.get("password_spraying", []):
+            writer.writerow(
+                {
+                    "type": "password_spraying",
+                    "ip": entry.get("ip"),
+                    "attempt_count": entry.get("attempt_count"),
+                    "user_count": entry.get("user_count"),
+                }
+            )
+
+        for entry in report.get("top_offenders", []):
+            writer.writerow(
+                {
+                    "type": "top_offender",
+                    "ip": entry.get("ip"),
+                    "failed_logins": entry.get("failed_logins"),
+                }
+            )
+
+
+def _write_report(path: Path, report: Mapping[str, object]) -> None:
+    if path.suffix.lower() == ".json":
+        _write_json_report(path, report)
+    elif path.suffix.lower() == ".csv":
+        _write_csv_report(path, report)
+    else:
+        raise SystemExit("Unsupported output format. Use a .json or .csv extension.")
+
+
 def main() -> None:
     args = _parse_args()
     if not args.log_file.is_file():
@@ -202,23 +300,39 @@ def main() -> None:
         min_attempts=args.spray_min_attempts,
     )
 
+    report = _build_report(
+        flagged=flagged,
+        spray_suspects=spray_suspects,
+        settings={
+            "mode": args.mode,
+            "threshold": args.threshold,
+            "window_minutes": args.window_minutes,
+            "spray_min_users": args.spray_min_users,
+            "spray_min_attempts": args.spray_min_attempts,
+        },
+    )
+
     if flagged:
         print("Flagged IPs (failed logins >= threshold):")
-        for ip, count in sorted(flagged.items(), key=lambda item: item[1], reverse=True):
+        for entry in report["brute_force"]:
+            ip = entry["ip"]
+            count = entry["failed_logins"]
             print(f"- {ip}: {count} failed logins")
     else:
         print("No IP addresses exceeded the failed login threshold.")
 
     if spray_suspects:
         print("\nPassword spraying suspects:")
-        for ip, stats in sorted(
-            spray_suspects.items(), key=lambda item: item[1]["attempt_count"], reverse=True
-        ):
-            print(
-                f"- {ip}: {stats['attempt_count']} failed attempts across {stats['user_count']} usernames"
-            )
+        for entry in report["password_spraying"]:
+            ip = entry["ip"]
+            attempts = entry["attempt_count"]
+            users = entry["user_count"]
+            print(f"- {ip}: {attempts} failed attempts across {users} usernames")
     else:
         print("\nNo password spraying suspects found.")
+
+    if args.output:
+        _write_report(args.output, report)
 
 
 if __name__ == "__main__":
