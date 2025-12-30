@@ -6,7 +6,7 @@ that exceed a configurable threshold.
 from __future__ import annotations
 
 import argparse
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 from datetime import datetime, timedelta
 from pathlib import Path
 import re
@@ -19,6 +19,10 @@ FAILED_PATTERNS = [
     re.compile(r"Failed login .* from (?P<ip>\d{1,3}(?:\.\d{1,3}){3})"),
     re.compile(r"Authentication failure.*rhost=(?P<ip>\d{1,3}(?:\.\d{1,3}){3})"),
 ]
+
+PASSWORD_SPRAY_PATTERN = re.compile(
+    r"Failed password for (?:invalid user )?(?P<user>\S+) from (?P<ip>\d{1,3}(?:\.\d{1,3}){3})"
+)
 
 GENERIC_IP_PATTERN = re.compile(r"(?P<ip>\b(?:\d{1,3}\.){3}\d{1,3}\b)")
 TIMESTAMP_PATTERN = re.compile(r"^(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})")
@@ -132,7 +136,50 @@ def _parse_args() -> argparse.Namespace:
         default="rate",
         help="Use 'rate' for time-window analysis or 'total' for overall counts.",
     )
+    parser.add_argument(
+        "--spray-min-users",
+        type=int,
+        default=5,
+        help="Minimum distinct usernames per IP to flag password spraying (default: 5).",
+    )
+    parser.add_argument(
+        "--spray-min-attempts",
+        type=int,
+        default=10,
+        help="Minimum failed attempts per IP to flag password spraying (default: 10).",
+    )
     return parser.parse_args()
+
+
+def detect_password_spraying(
+    lines: Iterable[str], *, min_users: int = 5, min_attempts: int = 10
+) -> Mapping[str, dict[str, int]]:
+    """Identify IPs that exhibit password spraying characteristics."""
+
+    if min_users < 1:
+        raise ValueError("Minimum users must be at least 1")
+    if min_attempts < 1:
+        raise ValueError("Minimum attempts must be at least 1")
+
+    users_per_ip: defaultdict[str, set[str]] = defaultdict(set)
+    attempts_per_ip: Counter[str] = Counter()
+
+    for line in lines:
+        match = PASSWORD_SPRAY_PATTERN.search(line)
+        if not match:
+            continue
+
+        ip = match.group("ip")
+        username = match.group("user")
+
+        users_per_ip[ip].add(username)
+        attempts_per_ip[ip] += 1
+
+    return {
+        ip: {"user_count": len(users_per_ip[ip]), "attempt_count": attempts}
+        for ip, attempts in attempts_per_ip.items()
+        if attempts >= min_attempts and len(users_per_ip[ip]) >= min_users
+    }
 
 
 def main() -> None:
@@ -140,20 +187,38 @@ def main() -> None:
     if not args.log_file.is_file():
         raise SystemExit(f"Log file not found: {args.log_file}")
 
+    lines = args.log_file.read_text().splitlines()
+
     flagged = analyze_log_file(
-        args.log_file.read_text().splitlines(),
+        lines,
         threshold=args.threshold,
         window_minutes=args.window_minutes,
         mode=args.mode,
     )
 
-    if not flagged:
-        print("No IP addresses exceeded the failed login threshold.")
-        return
+    spray_suspects = detect_password_spraying(
+        lines,
+        min_users=args.spray_min_users,
+        min_attempts=args.spray_min_attempts,
+    )
 
-    print("Flagged IPs (failed logins >= threshold):")
-    for ip, count in sorted(flagged.items(), key=lambda item: item[1], reverse=True):
-        print(f"- {ip}: {count} failed logins")
+    if flagged:
+        print("Flagged IPs (failed logins >= threshold):")
+        for ip, count in sorted(flagged.items(), key=lambda item: item[1], reverse=True):
+            print(f"- {ip}: {count} failed logins")
+    else:
+        print("No IP addresses exceeded the failed login threshold.")
+
+    if spray_suspects:
+        print("\nPassword spraying suspects:")
+        for ip, stats in sorted(
+            spray_suspects.items(), key=lambda item: item[1]["attempt_count"], reverse=True
+        ):
+            print(
+                f"- {ip}: {stats['attempt_count']} failed attempts across {stats['user_count']} usernames"
+            )
+    else:
+        print("\nNo password spraying suspects found.")
 
 
 if __name__ == "__main__":
