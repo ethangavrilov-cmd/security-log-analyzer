@@ -6,7 +6,7 @@ import pytest
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from main import analyze_log_file, detect_password_spraying
+from main import _build_report, _write_report, analyze_log_file, detect_password_spraying
 
 
 def test_analyze_log_file_flags_ips_over_threshold():
@@ -125,3 +125,50 @@ def test_detect_password_spraying_validates_thresholds():
 
     with pytest.raises(ValueError):
         detect_password_spraying([], min_users=1, min_attempts=0)
+
+
+def test_json_report_includes_all_sections(tmp_path: Path):
+    report_path = tmp_path / "report.json"
+
+    report = _build_report(
+        flagged={"10.0.0.1": 3},
+        spray_suspects={"10.0.0.2": {"attempt_count": 12, "user_count": 6}},
+        settings={"mode": "rate", "threshold": 5, "window_minutes": 5, "spray_min_users": 5, "spray_min_attempts": 10},
+    )
+
+    _write_report(report_path, report)
+
+    contents = report_path.read_text()
+    assert "\"run_settings\"" in contents
+    assert "\"brute_force\"" in contents
+    assert "\"password_spraying\"" in contents
+    assert "\"top_offenders\"" in contents
+
+
+def test_csv_report_flattens_sections(tmp_path: Path):
+    report_path = tmp_path / "report.csv"
+
+    report = _build_report(
+        flagged={"10.0.0.1": 2, "10.0.0.3": 5},
+        spray_suspects={},
+        settings={"mode": "total", "threshold": 2, "window_minutes": 1, "spray_min_users": 3, "spray_min_attempts": 7},
+    )
+
+    _write_report(report_path, report)
+
+    rows = report_path.read_text().splitlines()
+    assert rows[0].startswith("type,field,ip,failed_logins")
+    assert any("run_setting,mode,," in row for row in rows)
+    assert any("brute_force,,10.0.0.3,5" in row for row in rows)
+    assert any("top_offender,,10.0.0.3,5" in row for row in rows)
+
+
+def test_write_report_rejects_unknown_extension(tmp_path: Path):
+    report = _build_report(
+        flagged={},
+        spray_suspects={},
+        settings={},
+    )
+
+    with pytest.raises(SystemExit):
+        _write_report(tmp_path / "report.txt", report)
